@@ -22,7 +22,6 @@ def get_bible(url='http://www.godrules.net/downloads/web_utf8_FINAL.txt'):
 
 
 my_str = get_bible()
-
 vocab = sorted(set(my_str))
 count = {elem: my_str.count(elem) for elem in vocab}
 
@@ -90,6 +89,13 @@ def encode_batch(batch, one_hot_dimention=0):
     return batch_new[:, :-1], batch_new[:, -1]
 
 
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        xavier(m.weight.data)
+        xavier(m.bias.data)
+
+
 class CausalConv1d(nn.Conv1d):
     def __init__(self,
                  in_channels,
@@ -115,55 +121,35 @@ class CausalConv1d(nn.Conv1d):
         x = F.pad(input.unsqueeze(2), (self.left_padding, 0, 0, 0)).squeeze(2)
         return super(CausalConv1d, self).forward(x)
 
+
 class LSTMTagger(nn.Module):
 
-    def __init__(self, embedding_dim, hidden_dim, vocab_size, tagset_size):
+    def __init__(self, sentense_len, hidden_dim, vocab_size, n_layers=5):
         super(LSTMTagger, self).__init__()
         self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
 
-        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim)
+        self.word_embeddings = nn.Embedding(sentense_len, vocab_size)
 
-        self.conv1 = CausalConv1d(embedding_dim, embedding_dim, 2)
-        self.conv2 = CausalConv1d(embedding_dim, embedding_dim, 2, stride=2)
-        self.conv3 = CausalConv1d(embedding_dim, embedding_dim, 2, stride=4)
-        self.conv4 = CausalConv1d(embedding_dim, embedding_dim, 2, stride=8)
-
-        # The LSTM takes word embeddings as inputs, and outputs hidden states
-        # with dimensionality hidden_dim.
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim)
-        self.hidden = self.init_hidden()
-        self.lstm2 = nn.LSTM(hidden_dim, hidden_dim)
-        self.hidden2 = self.init_hidden()
-
-        # The linear layer that predicts next input
-        self.hidden2pred = nn.Linear(hidden_dim, tagset_size)
-
-    def init_hidden(self):
-        # Before we've done anything, we dont have any hidden state.
-        # Refer to the Pytorch documentation to see exactly
-        # why they have this dimensionality.
-        # The axes semantics are (num_layers, minibatch_size, hidden_dim)
-        return (autograd.Variable(torch.zeros(1, 1, self.hidden_dim)).cuda(),
-                autograd.Variable(torch.zeros(1, 1, self.hidden_dim)).cuda())
+        # Initialize the conv layers
+        self.conv = []
+        self.conv.append(CausalConv1d(vocab_size, hidden_dim, 2).cuda())
+        for i in range(n_layers - 2):
+            self.conv.append(CausalConv1d(hidden_dim,
+                                          hidden_dim,
+                                          kernel_size=2,
+                                          dilation=2 ** (i + 1)).cuda())
+        self.conv.append(CausalConv1d(hidden_dim, vocab_size, 2, 2 ** n_layers).cuda())
 
     def forward(self, sentence):
         embeds = self.word_embeddings(sentence)
-        conv_1 = F.selu(self.conv1(embeds))
-        conv_2 = conv_1.add(F.selu(self.conv2(conv_1)))
-        conv_3 = conv_2.add(F.selu(self.conv3(conv_2)))
-        conv_4 = conv_3.add(F.selu(self.conv4(conv_3)))
-        lstm_out, self.hidden = self.lstm(conv_4.view(len(sentence), 1, -1), self.hidden)
-        pred_space = self.hidden2pred(lstm_out.view(len(sentence), -1))
-        pred_scores = F.log_softmax(pred_space)
-        return pred_scores
+        _conv = F.selu(self.conv[0](embeds))
+        for i in range(self.n_layers - 2):
+            _conv = _conv.add(F.selu(self.conv[i + 1](_conv)))
 
-    # def forward(self, sentence):
-    #     embeds = self.word_embeddings(sentence)
-    #     lstm_out,  self.hidden  = self.lstm(embeds.view(len(sentence), 1, -1), self.hidden)
-    #     lstm_out2, self.hidden2 = self.lstm2(lstm_out.view(len(sentence), 1, -1), self.hidden2)
-    #     pred_space = self.hidden2pred(lstm_out2.view(len(sentence), -1))
-    #     pred_scores = F.log_softmax(pred_space)
-    #     return pred_scores
+        _conv = F.selu(self.conv[self.n_layers-1](_conv))
+        pred_scores = F.log_softmax(_conv.view(_conv.data.shape[:2]))
+        return pred_scores
 
 
 sentense_size = 200
@@ -171,8 +157,8 @@ HIDDEN_DIM = 64
 
 model = LSTMTagger(sentense_size,
                    HIDDEN_DIM,
-                   vocab_size=len(vocab),
-                   tagset_size=len(vocab))
+                   vocab_size=len(vocab))
+model.apply(weight_init)
 model.cuda()
 loss_function = nn.NLLLoss().cuda()
 
@@ -184,35 +170,28 @@ pred = model(inputs)
 print(pred)
 
 np_loss = 0
-lr = 0.002
+lr = 0.5
 t_start = time.time()
 optimizer = optim.SGD(model.parameters(), lr=lr)
 for iter in range(1000000):
-    sample = gen.next()
-    # Step 1. Remember that Pytorch accumulates gradients.
-    # We need to clear them out before each instance
     model.zero_grad()
 
-    # Also, we need to clear out the hidden state of the LSTM,
-    # detaching it from its history on the last instance.
-    model.hidden = model.init_hidden()
-
-    # Step 2. Get our inputs ready for the network, that is, turn them into
-    # Variables of word indices.
+    # Get next sample
+    sample = gen.next()
     all_sentense = encode_sample(sample)
     sentence_in = all_sentense[: -1]
     targets = all_sentense[1:]
 
-    # Step 3. Run our forward pass.
+    # Predict
     pred = model(sentence_in)
-
-    # Step 4. Compute the loss, gradients, and update the parameters by
-    #  calling optimizer.step()
     loss = loss_function(pred[10:], targets[10:])
     np_loss += loss.cpu().data.numpy()[0]
+
+    # Update
     loss.backward(retain_graph=True)
     optimizer.step()
 
+    # Maybe show stg
     if iter % 200 == 0:  # Test function
         t_total = time.time() - t_start
         t_start = time.time()
